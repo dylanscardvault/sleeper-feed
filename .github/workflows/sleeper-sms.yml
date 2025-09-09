@@ -15,182 +15,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with: { persist-credentials: true }
+        with:
+          persist-credentials: true
+          fetch-depth: 0
 
-      - name: Prep jq
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build SMS file
         run: |
-          sudo apt-get update -y && sudo apt-get install -y jq curl
-          mkdir -p outputs/sms
+          python scripts/build_sms.py
 
-      - name: Guardrail – ensure feed exists
-        run: |
-          test -f data/sleeper/latest.json || (echo "latest.json missing – run the Sleeper Feed (auto) workflow first." && exit 1)
-
-      - name: Build SMS Recap + Preview from latest.json
-        run: |
-          set -euo pipefail
-
-          FEED="data/sleeper/latest.json"
-          WEEK=$(jq -r '.state.week // 1' "$FEED")
-          RECAP=$((WEEK-1)); if [ "$RECAP" -lt 1 ]; then RECAP=1; fi
-
-          # Helper: pick team name -> prefer roster.metadata.team_name -> users.display_name -> "Team {roster_id}"
-          mk_map_js='
-            def name_of(roster):
-              (roster.metadata.team_name // empty) as $t
-              | if ($t|type=="string" and ($t|length)>0) then $t
-                else empty end;
-            def user_name(usr): (usr.display_name // usr.username // "") ;
-            def roster_owner_name(roster; users):
-              (users[] | select(.user_id==roster.owner_id)) as $u
-              | (name_of(roster) // user_name($u) // ("Team " + (roster.roster_id|tostring)));
-
-            def team_map(rosters; users):
-              reduce rosters[] as $r ({}; . + { ($r.roster_id|tostring): roster_owner_name($r; users) });
-          '
-
-          TEAM_MAP=$(jq -r --argjson users "$(jq '.users' "$FEED")" \
-                         --argjson rosters "$(jq '.rosters' "$FEED")" \
-                         "$mk_map_js team_map(\$rosters; \$users)" <<< '{}')
-
-          # Write helper to resolve roster_id -> name
-          name_for() { jq -r --arg rid "$1" --argjson m "$TEAM_MAP" '$m[$rid] // ("Team " + $rid)' <<< '{}'; }
-
-          # --- RECAP ---
-          # Pair winners/losers from recap matchups by matchup_id
-          jq -r '
-            def to_pairs:
-              group_by(.matchup_id)[] | if length==2 then . else . end;
-
-            def team_name(id; m):
-              m[tostring(id|tonumber)] // ("Team " + (id|tostring));
-
-            . as $root
-            | $root.matchups.recap
-            | if type=="array" and length>0 then
-                ( $root | {rosters, users} ) as $ctx
-                | ($ctx.rosters | reduce .[] as $r ({}; .+{($r.roster_id|tostring): ($r.metadata.team_name//empty // "")}))
-                | $root as $all
-                | $root # noop
-              else [] end
-          ' "$FEED" > /dev/null 2>&1 || true  # (recap lines are produced below with a simpler pass)
-
-          # Build quick stats for recap
-          RECAP_AWARDS=$(jq -r --argjson m "$TEAM_MAP" '
-            def nm(id): $m[tostring(id)] // ("Team " + (id|tostring));
-            [ group_by(.matchup_id)[] | select(length>=1) ] as $pairs
-            | $pairs
-            | map(
-                (.[0] | .points) as $p0
-                | (if length>1 then (.[1] | .points) else 0 end) as $p1
-                | (.[0] | .roster_id) as $r0
-                | (if length>1 then (.[1] | .roster_id) else null end) as $r1
-                | if $p0 >= $p1 then
-                    {w_id:$r0, w_pts:$p0, l_id:$r1, l_pts:$p1, diff: ($p0-($p1//0))}
-                  else
-                    {w_id:$r1, w_pts:$p1, l_id:$r0, l_pts:$p0, diff: (($p1//0)-$p0)}
-                  end
-              ) as $games
-            | if ($games|length)==0 then
-                {top:"(no games)", close:"(n/a)", blow:"(n/a)"}
-              else
-                {
-                  top: ( $games | max_by(.w_pts).w_id as $tid | ( $games | max_by(.w_pts) | "Team of the Week: " + (nm($tid)) + " (" + ( .w_pts|tostring ) + " pts)" ) ),
-                  close: ( $games | min_by(.diff) | "Closest: " + (nm(.w_id)) + " beat " + (nm(.l_id)) + " by " + (.diff|tostring) ),
-                  blow:  ( $games | max_by(.diff) | "Blowout: " + (nm(.w_id)) + " over " + (nm(.l_id)) + " by " + (.diff|tostring) )
-                }
-              end
-          ' "$FEED")
-
-          TOP_LINE=$(jq -r '.top' <<< "$RECAP_AWARDS")
-          CLOSE_LINE=$(jq -r '.close' <<< "$RECAP_AWARDS")
-          BLOW_LINE=$(jq -r '.blow' <<< "$RECAP_AWARDS")
-
-          # Build simple matchup lines for *current* week (preview)
-          PREVIEW_LINES=$(jq -r --argjson m "$TEAM_MAP" '
-            def nm(id): $m[tostring(id)] // ("Team " + (id|tostring));
-            [ group_by(.matchup_id)[] | select(length>=1)
-              | (.[0].roster_id) as $a
-              | (if length>1 then (.[1].roster_id) else null end) as $b
-              | "- " + nm($a) + " vs " + (if $b then nm($b) else "TBD" end)
-            ] | .[0:3] | .[]? ' \
-            <(jq '.matchups.current' "$FEED"))
-
-          # --- Trending + owned sets for waiver/trades ---
-          OWNED=$(jq -r '[.rosters[]?.players[]?] | map(tostring) | unique' "$FEED")
-          ADD_IDS=$(jq -r '[.trending.add[]?.player_id? | tostring] | unique' "$FEED")
-          DROP_IDS=$(jq -r '[.trending.drop[]?.player_id? | tostring] | unique' "$FEED")
-
-          # Resolve names for trending ids only (keeps it light)
-          IDS=$(jq -r -n --argjson a "$ADD_IDS" --argjson d "$DROP_IDS" '$a + $d | unique | join(",")')
-          if [ -n "$IDS" ]; then
-            curl -s https://api.sleeper.app/v1/players/nfl > /tmp/players.json
-          else
-            echo "{}" > /tmp/players.json
-          fi
-
-          # helper to list up to N players from an id array with name/pos/team
-          list_players () {
-            local json_ids="$1"; local limit="$2"
-            jq -r --argjson ids "$json_ids" --arg limit "$limit" '
-              def nm(id):
-                .[id] as $p
-                | if ($p|type)=="object" then
-                    ($p.full_name // $p.first_name + " " + ($p.last_name//"")) + " " +
-                    "(" + (($p.position//"") + (if $p.team then " " + $p.team else "" end)) + ")"
-                  else
-                    "Player " + id
-                  end;
-              $ids[0:($limit|tonumber)] | map( nm(.) ) | .[]?
-            ' /tmp/players.json
-          }
-
-          # Build sections
-          {
-            echo "🏈 Week $WEEK Preview + Waivers"
-            echo "— — —"
-            echo "Key Matchups:"
-            if [ -n "$PREVIEW_LINES" ]; then echo "$PREVIEW_LINES"; else echo "- (schedule not posted yet)"; fi
-            echo ""
-            echo "Waiver Adds:"
-            UNOWNED=$(jq -r -n --argjson owned "$OWNED" --argjson add "$ADD_IDS" '($add - $owned) | .')
-            list_players "$UNOWNED" 6 | sed 's/^/- /'
-            echo ""
-            echo "Trade Targets (Buy):"
-            OWNED_ADDS=$(jq -r -n --argjson owned "$OWNED" --argjson add "$ADD_IDS" '($add * $owned) | .')
-            list_players "$OWNED_ADDS" 4 | sed 's/^/- /'
-            echo ""
-            echo "Trade Away (Sell):"
-            OWNED_DROPS=$(jq -r -n --argjson owned "$OWNED" --argjson drop "$DROP_IDS" '($drop * $owned) | .')
-            list_players "$OWNED_DROPS" 4 | sed 's/^/- /'
-            echo ""
-            echo "— — —"
-            echo "Last Week (Quick Hits):"
-            echo "- ${TOP_LINE}"
-            echo "- ${CLOSE_LINE}"
-            echo "- ${BLOW_LINE}"
-            echo ""
-            echo "Closer: set your lineups and hydrate. Fantasy tilt is cardio."
-          } > "outputs/sms/preview_week${WEEK}.txt"
-
-          # Recap file is just the awards + simple note
-          {
-            echo "📊 Week $RECAP Recap — Highlights"
-            echo "- ${TOP_LINE}"
-            echo "- ${CLOSE_LINE}"
-            echo "- ${BLOW_LINE}"
-            echo ""
-            echo "Standings & power ranks coming in the morning newsletter. Same bat-time, same bat-text."
-          } > "outputs/sms/recap_week${RECAP}.txt"
-
-      - name: Commit SMS outputs
+      - name: Commit SMS output
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add outputs/sms/*.txt
           if ! git diff --cached --quiet; then
-            git commit -m "chore(sms): update weekly preview/recap"
+            git commit -m "chore(sms): add weekly SMS preview"
             git push
           else
-            echo "No SMS changes."
+            echo "No new SMS changes."
           fi
