@@ -44,7 +44,7 @@ jobs:
           curl -s "https://api.sleeper.app/v1/players/nfl/trending/drop?lookback_hours=168&limit=200" > data/sleeper/trending_drop.json
 
           curl -s https://api.sleeper.app/v1/league/$LID/drafts > data/sleeper/drafts.json
-RDID=$(jq -r '[.[] | select(.type=="rookie")] | sort_by(.start_time) | last // empty | .draft_id' data/sleeper/drafts.json)
+          RDID=$(jq -r '[.[] | select(.type=="rookie")] | sort_by(.start_time) | .[-1].draft_id // empty' data/sleeper/drafts.json)
           if [ -n "$RDID" ] && [ "$RDID" != "null" ]; then
             curl -s https://api.sleeper.app/v1/draft/$RDID/picks > data/sleeper/rookie_picks.json
           else
@@ -64,22 +64,22 @@ RDID=$(jq -r '[.[] | select(.type=="rookie")] | sort_by(.start_time) | last // e
             --slurpfile drop   data/sleeper/trending_drop.json \
             --slurpfile drafts data/sleeper/drafts.json \
             --slurpfile rp     data/sleeper/rookie_picks.json \
-            '{\
-              fetched_at: now,\
-              state: $state[0],\
-              league: $league[0],\
-              users: $users[0],\
-              rosters: $rosters[0],\
-              matchups: { recap: $recap, current: $now, next: $next },\
-              transactions: { recap: $tx[0] },\
-              trending: { add: $add[0], drop: $drop[0] },\
-              drafts: $drafts[0],\
-              rookie_picks: $rp[0]\
+            '{ 
+              fetched_at: now,
+              state: $state[0],
+              league: $league[0],
+              users: $users[0],
+              rosters: $rosters[0],
+              matchups: { recap: $recap, current: $now, next: $next },
+              transactions: { recap: $tx[0] },
+              trending: { add: $add[0], drop: $drop[0] },
+              drafts: $drafts[0],
+              rookie_picks: $rp[0]
             }' > data/sleeper/latest.json
 
       - name: Commit updated feed
         run: |
-          git config user.name  "github-actions[bot]"
+          git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add data/sleeper/latest.json data/sleeper/*.json
           if ! git diff --cached --quiet; then
