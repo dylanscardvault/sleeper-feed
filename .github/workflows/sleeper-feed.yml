@@ -82,25 +82,22 @@ jobs:
               rookie_picks: $rp[0]}' \
             > data/sleeper/latest.json
 
-           - name: Commit updated feed
+      - name: Commit updated feed
         shell: bash
         run: |
           set -euo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # make sure we're on main and in sync
           git fetch origin main
           git checkout main
 
-          # we already modified files above; stash them so we can rebase cleanly
+          # stash changes so we can rebase cleanly
           git add -A
           git stash push -m "pre-rebase-$(date +%s)" || true
           git pull --rebase origin main
-          # bring our generated changes back
           git stash pop || true
 
-          # stage & commit if there are changes
           git add -A
           if ! git diff --cached --quiet; then
             git commit -m "chore(feed): update Sleeper pull"
@@ -108,6 +105,3 @@ jobs:
           else
             echo "No changes."
           fi
-
-
-          
