@@ -1,236 +1,226 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 """
-Builds an SMS-friendly league preview/waiver/trade note from Sleeper public data
-fetched into data/sleeper/latest.json by the sleeper-feed workflow.
-
-This script is intentionally defensive about JSON shapes so it won't crash if
-Sleeper returns slightly different structures (e.g., dict vs list).
+Builds an SMS-friendly league preview/recap from Sleeper pull.
+Input:  data/sleeper/latest.json   (written by sleeper-feed.yml)
+Output: data/sleeper/sms.txt
 """
-
-from __future__ import annotations
 
 import json
+from collections import defaultdict
 from pathlib import Path
-from collections import defaultdict, Counter
-from datetime import datetime, timezone
+from typing import Dict, List, Any, Tuple
 
-ROOT = Path(__file__).resolve().parents[1]
-DATA_DIR = ROOT / "data" / "sleeper"
-LATEST_JSON = DATA_DIR / "latest.json"
-OUT_SMS = DATA_DIR / "sms.txt"
+DATA_DIR = Path("data/sleeper")
+LATEST = DATA_DIR / "latest.json"
+SMS_OUT = DATA_DIR / "sms.txt"
 
-def load_latest() -> dict:
-    if not LATEST_JSON.exists():
-        raise SystemExit(f"Missing {LATEST_JSON} — run the pull job first.")
-    with LATEST_JSON.open("r", encoding="utf-8") as f:
+
+def load_latest() -> Dict[str, Any]:
+    with open(LATEST, "r") as f:
         return json.load(f)
 
-def is_listlike(x) -> bool:
-    return isinstance(x, (list, tuple))
 
-def as_list(x):
-    if x is None:
-        return []
-    return list(x) if is_listlike(x) else [x]
+def safe_float(x) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return 0.0
 
-def safe_matchup_chunks(j: dict):
+
+def build_team_maps(j: Dict[str, Any]) -> Tuple[Dict[str, str], Dict[int, str]]:
     """
-    Returns (current_raw, next_raw) as lists of matchup records.
-    Accepts:
-      - j["matchups"] as dict with keys "current"/"next"
-      - j["matchups"] as already-a-list (we treat as current)
-      - anything else -> empty lists
+    Returns:
+      user_id -> team display name
+      roster_id -> team display name
     """
-    matchups = j.get("matchups")
-    if isinstance(matchups, dict):
-        current_raw = as_list(matchups.get("current"))
-        next_raw = as_list(matchups.get("next"))
-    elif is_listlike(matchups):
-        current_raw = list(matchups)
-        next_raw = []
+    users = j.get("users", []) or []
+    rosters = j.get("rosters", []) or []
+
+    # user_id -> nice name (prefer team_name if league shows team names)
+    user_to_name: Dict[str, str] = {}
+    for u in users:
+        meta = (u.get("metadata") or {})
+        team_name = meta.get("team_name") or meta.get("team_name_update")  # sometimes it’s stored here
+        display = team_name or u.get("display_name") or u.get("username") or str(u.get("user_id") or "")
+        user_to_name[str(u.get("user_id"))] = display
+
+    # roster_id -> nice name (by owner_id -> name)
+    roster_to_name: Dict[int, str] = {}
+    for r in rosters:
+        rid = int(r.get("roster_id"))
+        owner = str(r.get("owner_id"))
+        roster_to_name[rid] = user_to_name.get(owner, f"Roster {rid}")
+
+    return user_to_name, roster_to_name
+
+
+def group_by_matchup_id(matchups: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+    """
+    Turn a flat list of matchup rows into pairs (or groups) by matchup_id.
+    """
+    groups: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    for m in matchups or []:
+        mid = m.get("matchup_id")
+        if mid is None:
+            # If Sleeper returns 0/None in off weeks, bucket them separately by roster_id
+            mid = 10_000_000 + int(m.get("roster_id", 0))
+        groups[int(mid)].append(m)
+    # Sort for stability
+    return [groups[k] for k in sorted(groups.keys())]
+
+
+def format_pair(pair: List[Dict[str, Any]], roster_to_name: Dict[int, str]) -> str:
+    """
+    Build a 1-liner for a matchup group.
+    """
+    if not pair:
+        return "TBD vs TBD"
+
+    # Each item has: roster_id, points (recap), or projections in-season in some contexts
+    names = [roster_to_name.get(int(p.get("roster_id")), f"Roster {p.get('roster_id')}") for p in pair]
+    # Ensure exactly two names for a tidy line
+    if len(names) == 1:
+        names.append("TBD")
+
+    # Pull points if present (recap week)
+    pts = [safe_float(p.get("points")) for p in pair]
+    if any(p > 0 for p in pts):
+        # Show score ordering: TeamA 123.4 — TeamB 118.7
+        left = f"{names[0]} {pts[0]:.1f}"
+        right = f"{names[1]} {pts[1]:.1f}" if len(pts) > 1 else names[1]
+        return f"{left} — {right}"
     else:
-        current_raw, next_raw = [], []
-    # Flatten any nested single-element lists Sleeper can sometimes return
-    def flatten(xs):
-        out = []
-        for x in xs:
-            if is_listlike(x):
-                out.extend(x)
-            else:
-                out.append(x)
-        return out
-    return flatten(current_raw), flatten(next_raw)
+        # Preview style without points
+        return f"{names[0]} vs {names[1]}"
 
-def pair_by_matchup_id(rows: list[dict]) -> list[tuple[dict, dict]]:
-    """Group matchup rows into (teamA, teamB) pairs by matchup_id."""
-    by = defaultdict(list)
-    for m in rows:
-        # Some rows may lack matchup_id; bucket them by a rolling key
-        key = m.get("matchup_id")
-        by[str(key)].append(m)
-    pairs = []
-    for _, bucket in by.items():
-        if len(bucket) >= 2:
-            pairs.append((bucket[0], bucket[1]))
-        elif len(bucket) == 1:
-            # If only one side present, pair with None (still printable)
-            pairs.append((bucket[0], {}))
-    return pairs
 
-def roster_owner_maps(users, rosters):
-    # Map user_id -> display team name if available (use metadata name)
-    user_name = {}
-    for u in as_list(users):
-        # Prefer team name if Sleeper exposes it under display_name; else username
-        nm = (u.get("metadata", {}) or {}).get("team_name") \
-             or u.get("display_name") \
-             or u.get("username") \
-             or f"user_{u.get('user_id','?')}"
-        user_name[u.get("user_id")] = nm
+def find_awards(recap_pairs: List[List[Dict[str, Any]]], roster_to_name: Dict[int, str]) -> Dict[str, str]:
+    """
+    Compute top scorer, closest game, blowout from recap pairs.
+    """
+    if not recap_pairs:
+        return {}
 
-    # Map roster_id -> user display name (or “Team X” fallback)
-    rid_to_user = {}
-    for r in as_list(rosters):
-        rid = r.get("roster_id")
-        uid = r.get("owner_id")
-        nm = user_name.get(uid) or f"Team {rid}"
-        rid_to_user[rid] = nm
-    return rid_to_user
+    def pair_points(pair):
+        pts = [safe_float(x.get("points")) for x in pair]
+        return pts if len(pts) == 2 else (pts + [0.0])[:2]
 
-def nice_team(rid, rid_to_user):
-    return rid_to_user.get(rid, f"Team {rid or '?'}")
+    top_team = ""
+    top_pts = -1.0
+    closest_line = ""
+    closest_diff = 10**9
+    blowout_line = ""
+    blowout_diff = -1.0
 
-def build_matchup_lines(pairs, rid_to_user):
+    for pair in recap_pairs:
+        pts = pair_points(pair)
+        names = [roster_to_name.get(int(x.get("roster_id")), f"Roster {x.get('roster_id')}") for x in pair]
+        if len(names) == 1:
+            names.append("TBD")
+
+        # top scorer (team with max points)
+        for n, p in zip(names, pts):
+            if p > top_pts:
+                top_pts = p
+                top_team = n
+
+        # diffs
+        if len(pts) == 2:
+            diff = abs(pts[0] - pts[1])
+            line = f"{names[0]} {pts[0]:.1f} — {names[1]} {pts[1]:.1f} (Δ {diff:.1f})"
+            if diff < closest_diff:
+                closest_diff = diff
+                closest_line = line
+            if diff > blowout_diff:
+                blowout_diff = diff
+                blowout_line = line
+
+    out = {}
+    if top_team:
+        out["Top Scorer"] = f"{top_team} ({top_pts:.1f})"
+    if closest_line:
+        out["Closest Game"] = closest_line
+    if blowout_line:
+        out["Blowout"] = blowout_line
+    return out
+
+
+def standings_snapshot(rosters: List[Dict[str, Any]], roster_to_name: Dict[int, str]) -> List[str]:
     lines = []
-    for a, b in pairs:
-        an = nice_team(a.get("roster_id"), rid_to_user)
-        bn = nice_team(b.get("roster_id"), rid_to_user) if b else "TBD"
-        # If projected or points exist, show a tiny blurb
-        ap = a.get("points") or a.get("starters_points") or 0
-        bp = b.get("points") or b.get("starters_points") or 0
-        # Keep SMS short
-        if ap or bp:
-            lines.append(f"{an} vs {bn} — {ap:.1f}-{bp:.1f}")
-        else:
-            lines.append(f"{an} vs {bn}")
-    return lines[:3]  # cap at 3 bullets for SMS
+    # Sleeper stores wins/losses in roster.settings
+    table = []
+    for r in rosters or []:
+        s = r.get("settings") or {}
+        wins = int(s.get("wins", 0))
+        losses = int(s.get("losses", 0))
+        ties = int(s.get("ties", 0))
+        fpts = safe_float(s.get("fpts", 0)) + safe_float(s.get("fpts_decimal", 0)) / 100.0
+        name = roster_to_name.get(int(r.get("roster_id")), f"Roster {r.get('roster_id')}")
+        table.append((wins, -fpts, name, wins, losses, ties, fpts))
+    # Sort: wins desc, points for desc as tiebreaker
+    table.sort(key=lambda x: (x[0], -x[6]), reverse=True)
+    for _, __, name, w, l, t, pf in table[:5]:  # keep SMS tight (top 5)
+        rec = f"{w}-{l}" + (f"-{t}" if t else "")
+        lines.append(f"{name} {rec} (PF {pf:.1f})")
+    return lines
 
-def trending_blurbs(j: dict, rid_to_user: dict):
-    # Build owned set by player_id (from each roster's players list)
-    owned = set()
-    for r in as_list(j.get("rosters")):
-        for pid in as_list(r.get("players")):
-            owned.add(str(pid))
 
-    adds = as_list(j.get("trending", {}).get("add"))
-    drops = as_list(j.get("trending", {}).get("drop"))
+def build_sms(j: Dict[str, Any]) -> str:
+    _, roster_to_name = build_team_maps(j)
 
-    # Simple readable fields (Sleeper trending items often include player_id & count)
-    def label(x):
-        # Try name/pos/team if sleeper expanded; otherwise show player_id
-        nm = x.get("player_name") or x.get("name") or x.get("full_name") or x.get("first_name")
-        if nm:
-            pos = x.get("position") or x.get("pos")
-            tm = x.get("team") or x.get("pro_team")
-            core = nm
-            if pos: core += f" {pos}"
-            if tm:  core += f" ({tm})"
-            return core
-        return f"Player {x.get('player_id','?')}"
+    # Matchups structure is object with lists: recap/current/next
+    msets = j.get("matchups", {}) or {}
+    recap_pairs = group_by_matchup_id(msets.get("recap") or [])
+    current_pairs = group_by_matchup_id(msets.get("current") or [])
+    next_pairs = group_by_matchup_id(msets.get("next") or [])
 
-    # Waiver Adds: unowned trending adds
-    waiver_adds = []
-    for x in adds:
-        pid = str(x.get("player_id"))
-        if pid and pid not in owned:
-            waiver_adds.append(label(x))
-    waiver_adds = waiver_adds[:6] if waiver_adds else []
-
-    # Trade For: highly added but already owned by someone
-    trade_for = []
-    for x in adds:
-        pid = str(x.get("player_id"))
-        if pid and pid in owned:
-            trade_for.append(label(x))
-    trade_for = trade_for[:5]
-
-    # Trade Away: heavily dropped
-    drop_counts = Counter([str(x.get("player_id")) for x in drops if x.get("player_id")])
-    trade_away = [label(x) for x in drops if drop_counts.get(str(x.get("player_id"))) and label(x)]
-    # De-dup while preserving order
-    seen = set()
-    ta_unique = []
-    for t in trade_away:
-        if t not in seen:
-            seen.add(t)
-            ta_unique.append(t)
-    trade_away = ta_unique[:5]
-
-    return waiver_adds, trade_for, trade_away
-
-def build_sms(j: dict) -> str:
-    # Headline
+    # Compose sections (SMS-friendly)
+    out: List[str] = []
     league = j.get("league", {}) or {}
-    lg_name = league.get("name") or league.get("metadata", {}).get("name") or "League"
-    state = j.get("state", {}) or {}
-    week = state.get("week")
-    fetched_at = j.get("fetched_at")
-    ts = datetime.fromtimestamp(fetched_at, tz=timezone.utc).astimezone().strftime("%b %d, %I:%M %p")
+    lname = league.get("name") or "Your League"
+    out.append(f"🏈 {lname}: Weekly Preview")
+    out.append("")
 
-    users = as_list(j.get("users"))
-    rosters = as_list(j.get("rosters"))
-    rid_to_user = roster_owner_maps(users, rosters)
+    # Key Matchups (prefer current, else next)
+    use_pairs = current_pairs if current_pairs else next_pairs
+    if use_pairs:
+        out.append("Key Matchups:")
+        for pair in use_pairs[:3]:
+            out.append(f"• {format_pair(pair, roster_to_name)}")
+        out.append("")
 
-    current_raw, next_raw = safe_matchup_chunks(j)
-    cur_pairs = pair_by_matchup_id(current_raw)
-    nxt_pairs = pair_by_matchup_id(next_raw)
+    # Recap highlights (if we have them)
+    if recap_pairs:
+        awards = find_awards(recap_pairs, roster_to_name)
+        if awards:
+            out.append("Last Week:")
+            if "Top Scorer" in awards:
+                out.append(f"• Top Scorer: {awards['Top Scorer']}")
+            if "Closest Game" in awards:
+                out.append(f"• Closest: {awards['Closest Game']}")
+            if "Blowout" in awards:
+                out.append(f"• Blowout: {awards['Blowout']}")
+            out.append("")
 
-    waiver_adds, trade_for, trade_away = trending_blurbs(j, rid_to_user)
+    # Standings snapshot (top 5)
+    snap = standings_snapshot(j.get("rosters") or [], roster_to_name)
+    if snap:
+        out.append("Standings (Top 5):")
+        for line in snap:
+            out.append(f"• {line}")
+        out.append("")
 
-    lines = []
-    lines.append(f"{lg_name} — Week {week} Preview 🔮")
-    lines.append(f"(auto-pulled {ts})")
-    lines.append("")
-    # Key Matchups
-    if cur_pairs or nxt_pairs:
-        lines.append("Key Matchups:")
-        ml = build_matchup_lines(cur_pairs or nxt_pairs, rid_to_user)
-        for m in ml:
-            lines.append(f"• {m}")
-        lines.append("")
+    out.append("Good luck 🍀 — set those lineups!")
+    return "\n".join(out).strip()
 
-    # Waiver Adds
-    if waiver_adds:
-        lines.append("Waiver Adds:")
-        for w in waiver_adds:
-            lines.append(f"• {w}")
-        lines.append("")
-
-    # Trade targets
-    if trade_for:
-        lines.append("Trade For (buy):")
-        for t in trade_for:
-            lines.append(f"• {t}")
-    if trade_away:
-        lines.append("Trade Away (sell):")
-        for t in trade_away:
-            lines.append(f"• {t}")
-    if trade_for or trade_away:
-        lines.append("")
-
-    # Closer
-    lines.append("Good luck. Set lineups, win friends, fleece responsibly 🧀.")
-
-    return "\n".join(lines).strip() + "\n"
 
 def main():
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     j = load_latest()
-    OUT_SMS.parent.mkdir(parents=True, exist_ok=True)
     sms = build_sms(j)
-    OUT_SMS.write_text(sms, encoding="utf-8")
-    print(f"Wrote {OUT_SMS.relative_to(ROOT)} ({len(sms)} chars)")
+    SMS_OUT.write_text(sms, encoding="utf-8")
+    print(f"Wrote {SMS_OUT} ({len(sms)} chars)")
+
 
 if __name__ == "__main__":
     main()
