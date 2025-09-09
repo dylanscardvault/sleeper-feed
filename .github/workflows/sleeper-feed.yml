@@ -10,12 +10,17 @@ permissions:
   contents: write
 
 jobs:
-  pull:
+  pull: concurrency:
+  group: sleeper-feed
+  cancel-in-progress: true
+
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          persist-credentials: true
+  with:
+    persist-credentials: true
+    fetch-depth: 0
+
 
       - name: "Fetch league data via Sleeper public API"
         shell: bash
@@ -77,17 +82,25 @@ jobs:
               rookie_picks: $rp[0]}' \
             > data/sleeper/latest.json
 
-      - name: Commit updated feed
+            - name: Commit updated feed
         shell: bash
         run: |
           set -euo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/sleeper/latest.json data/sleeper/*.json
+
+          # ensure we're up to date before committing
+          git fetch origin main
+          git checkout main
+          git pull --rebase origin main
+
+          # stage everything we just generated
+          git add -A
           if ! git diff --cached --quiet; then
             git commit -m "chore(feed): update Sleeper pull"
-            git push
+            git push origin HEAD:main
           else
             echo "No changes."
           fi
+
           
