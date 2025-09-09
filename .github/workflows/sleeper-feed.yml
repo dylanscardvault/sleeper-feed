@@ -44,7 +44,7 @@ jobs:
           curl -s "https://api.sleeper.app/v1/players/nfl/trending/drop?lookback_hours=168&limit=200" > data/sleeper/trending_drop.json
 
           curl -s https://api.sleeper.app/v1/league/$LID/drafts > data/sleeper/drafts.json
-          RDID=$(jq -r '[.[] | select(.type==\"rookie\")] | sort_by(.start_time) | last // empty | .draft_id' data/sleeper/drafts.json)
+RDID=$(jq -r '[.[] | select(.type=="rookie")] | sort_by(.start_time) | last // empty | .draft_id' data/sleeper/drafts.json)
           if [ -n "$RDID" ] && [ "$RDID" != "null" ]; then
             curl -s https://api.sleeper.app/v1/draft/$RDID/picks > data/sleeper/rookie_picks.json
           else
