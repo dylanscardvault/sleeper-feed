@@ -2,24 +2,25 @@ name: Sleeper Feed (auto)
 
 on:
   schedule:
-    - cron: "0 11 * * 2,3"   # Tue & Wed 7:00 AM ET during DST
-    - cron: "0 12 * * 2,3"   # Tue & Wed 7:00 AM ET during Standard Time
+    - cron: "0 11 * * 2,3"   # Tue & Wed 7:00 AM ET (DST)
+    - cron: "0 12 * * 2,3"   # Tue & Wed 7:00 AM ET (Standard)
   workflow_dispatch:
 
 permissions:
   contents: write
 
-jobs:
-  pull: concurrency:
+concurrency:
   group: sleeper-feed
   cancel-in-progress: true
 
+jobs:
+  pull:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-  with:
-    persist-credentials: true
-    fetch-depth: 0
+        with:
+          persist-credentials: true
+          fetch-depth: 0
 
 
       - name: "Fetch league data via Sleeper public API"
