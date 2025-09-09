@@ -18,9 +18,10 @@ jobs:
         with:
           persist-credentials: true
 
-      - name: Fetch league data via Sleeper public API
+            - name: Fetch league data via Sleeper public API
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
           sudo apt-get update -y && sudo apt-get install -y jq
           LID="1180875820112609280"
 
@@ -44,7 +45,9 @@ jobs:
           curl -s "https://api.sleeper.app/v1/players/nfl/trending/drop?lookback_hours=168&limit=200" > data/sleeper/trending_drop.json
 
           curl -s https://api.sleeper.app/v1/league/$LID/drafts > data/sleeper/drafts.json
-          RDID=$(jq -r '[.[] | select(.type=="rookie")] | sort_by(.start_time) | .[-1].draft_id // empty' data/sleeper/drafts.json)
+          # ✅ Fixed jq program (no backslashes, no `last // empty`)
+          RDID=$(jq -r '[.[] | select(.type=="rookie")] | sort_by(.start_time) | (.[-1].draft_id // empty)' data/sleeper/drafts.json)
+
           if [ -n "$RDID" ] && [ "$RDID" != "null" ]; then
             curl -s https://api.sleeper.app/v1/draft/$RDID/picks > data/sleeper/rookie_picks.json
           else
